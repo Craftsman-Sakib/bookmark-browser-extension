@@ -1,0 +1,607 @@
+AegisMark 2.0 — Review of the revised engineering specification
+I've read the entire revised document (524 lines).
+
+My initial reaction is positive: this is a substantial improvement over AegisMark 1.0. Whoever revised it has addressed most of the major architectural problems we identified.
+
+However, I wouldn't approve it for full development just yet.
+
+There are still some important technical mistakes, security gaps, and inconsistencies. A few are particularly serious because they concern the encryption and synchronization mechanisms that are supposed to be AegisMark's strongest selling points.
+
+I'll be a little stricter in this review because we're moving from a product idea toward an actual engineering specification.
+1. Overall assessment
+AegisMark 2.0
+Major improvement
+
+8/10
+My qualitative assessment of the specification, not a measurement of implemented security.
+
+Area	Assessment
+Product concept	9/10
+Simplicity and MVP scope	9/10
+Encryption architecture	7/10
+Key management	7/10
+Synchronization	7/10
+Browser compatibility	7/10
+Privacy architecture	8/10
+Store compliance	7/10
+Ownership provisions	6/10
+Testing and verification	5/10
+
+
+What has improved significantly?
+These are meaningful improvements, not just cosmetic changes:
+1. KEK/DEK key hierarchy replaces the simplistic original encryption design.
+2. Stronger PBKDF2 configuration.
+3. Encrypted bookmark metadata.
+4. Removal of unnecessary bookmark permissions from the default manifest.
+5. A realistic distinction between desktop extensions, mobile extensions and web companions.
+6. Conflict-preserving synchronization instead of naive last-write-wins.
+7. Dead-link detection and web scraping postponed.
+8. Local-first functionality without requiring an account.
+9. Better distinction between shared application logic and browser-specific adapters.
+10. A more realistic approach to browser-store compliance.
+I would retain almost all of these decisions.
+
+But there are some problems I want addressed before you give the developer the green light.
+
+2. Critical issues still present
+Issue 1 — The recovery mnemonic specification is technically incomplete
+Critical
+Look at this statement:
+A 256-bit emergency Vault Recovery Key (exportable as a 12-word recovery mnemonic).
+
+This needs correction.
+
+A standard 12-word mnemonic using a 2,048-word vocabulary cannot encode 256 bits of entropy. Twelve words in the commonly used BIP39 format encode 128 bits of entropy plus a checksum.
+
+That is not the same as a randomly generated 256-bit recovery key.
+
+There are two ways to resolve this:
+
+Option A — Use a standard 24-word BIP39 recovery phrase.
+- 256 bits of entropy.
+- Four checksum bits.
+- Standardized recovery representation.
+- More words to write down and protect.
+Option B — Use a standard 12-word recovery phrase.
+- 128 bits of entropy.
+- Four checksum bits.
+- Simpler recovery experience.
+- Still a substantial amount of cryptographic entropy when generated correctly.
+My recommendation: use a properly implemented standard 24-word BIP39 recovery phrase if the specification insists on a 256-bit recovery key.
+
+Don't invent a custom 12-word encoding.
+
+Also, the recovery phrase should be displayed once during setup, require confirmation, and never be transmitted to the backend.
+Issue 2 — AES-GCM nonce management is still problematic
+Critical
+The document says:
+Guaranteed 96-bit random IV per write; counter-based collision prevention.
+
+These are two different approaches, and the specification doesn't explain how they work together.
+
+More importantly, there's a serious multi-device issue.
+
+Imagine:
+- Your Windows computer has the same DEK as your Android device.
+- Both devices independently encrypt bookmarks.
+- Both generate IVs.
+- Both use AES-256-GCM with the same DEK.
+You must guarantee that they never reuse an IV under that key.
+
+A local counter on each device is insufficient because the counters can overlap.
+
+I recommend that the developer choose and formally specify one of these approaches:
+1. A carefully engineered globally unique nonce allocation system.
+2. Independent per-device encryption subkeys derived from the vault key, with separate nonce spaces.
+3. A rigorously designed random-nonce approach with explicit collision-risk analysis and key rotation limits.
+For this application, I would investigate per-device derived encryption keys.
+
+For example:
+Vault master DEK
+Key derivation with device-specific context
+
+Windows key
+
+Device A
+
+
+Android key
+
+Device B
+
+
+
+Each device uses its own encryption key and independently managed nonce space.
+
+This needs careful implementation, especially when another device needs to decrypt the records.
+
+The specification should not use the word "guaranteed" until the actual nonce allocation mechanism has been formally defined.
+Issue 3 — The zero-knowledge claim still contradicts the database schema
+Critical
+This is one of the most important remaining issues.
+
+The specification says:
+All sensitive bookmark metadata is encrypted.
+
+But its EncryptedBookmarkRecord still exposes:
+interface EncryptedBookmarkRecord {
+  id: string;
+  version: number;
+  deviceId: string;
+  updatedAt: number;
+  isDeleted: boolean;
+  iv: string;
+  ciphertext: string;
+}
+
+
+The following fields are still visible to the server:
+- version
+- deviceId
+- updatedAt
+- isDeleted
+These reveal information about synchronization activity.
+
+For example, the server might learn when you modify or delete records and which device is active.
+
+This doesn't automatically break zero-knowledge encryption, but it contradicts the claim of eliminating metadata leakage.
+
+I recommend:
+Field	Recommendation
+id	Random, non-descriptive identifier
+version	Keep only if necessary; protect against rollback
+deviceId	Use opaque device identifiers
+updatedAt	Move inside ciphertext if possible
+isDeleted	Use encrypted tombstone payloads where feasible
+iv	Keep visible as required for decryption
+ciphertext	Keep visible
+
+You can never completely hide every operational detail while operating a synchronization service.
+
+The objective should be to minimize metadata exposure and document exactly what the server can observe.
+
+Issue 4 — Argon2id is mentioned but not actually specified
+Major
+The document says:
+PBKDF2-HMAC-SHA256 with 600,000 iterations (with support for Argon2id).
+
+This sounds reasonable, but it leaves a critical decision unresolved.
+
+Which algorithm will actually be used?
+
+OWASP currently prefers Argon2id, with a baseline configuration of 19 MiB memory, two iterations and parallelism of one. It recommends PBKDF2-HMAC-SHA256 with 600,000 iterations particularly when FIPS-140 compliance is required. 
+
+OWASP Cheat Sheet Series
+
+I would recommend:
+- Argon2id as the default password-based key derivation algorithm.
+- PBKDF2 as a configurable alternative where compatibility or compliance requires it.
+- Store the algorithm and parameters in the vault's versioned encryption header.
+- Benchmark performance on low-end Android devices and desktop computers.
+- Allow future upgrades without requiring users to recreate their vaults.
+Also, don't confuse the password derivation used for the encryption vault with server-side account password authentication. They are separate security responsibilities.
+Issue 5 — The synchronization protocol still needs protection against malicious servers
+Critical
+The revised document has made a good start with:
+- Version tracking.
+- Device IDs.
+- Tombstones.
+- Conflict detection.
+- Revision ordering.
+But there is a missing security problem: rollback attacks.
+
+Imagine:
+1. You save 500 bookmarks.
+2. The server receives the encrypted records.
+3. You later save another 100 bookmarks.
+4. Someone compromises the server.
+5. The server sends your devices an older, valid encrypted snapshot containing only 500 bookmarks.
+AES-GCM will not necessarily detect this. The old ciphertext is still authentic.
+
+The server doesn't need to decrypt your bookmarks to cause this problem.
+
+I would require:
+- Anti-replay protection.
+- Anti-rollback protection.
+- Authenticated synchronization revisions.
+- Device authorization and revocation.
+- Signed or otherwise authenticated change history.
+- Detection of missing synchronization events.
+- Recovery from corrupted or incomplete synchronization.
+You should also consider what happens if the server intentionally drops, reorders or withholds changes.
+
+A zero-knowledge server should not automatically be a trusted server.
+Issue 6 — Device encryption and account authentication are not sufficiently defined
+Major
+The document explains how the vault is encrypted, but not how a new device becomes authorized.
+
+For example:
+
+A user purchases a new laptop.
+
+How does that laptop obtain permission to access the encrypted vault?
+
+I would define a proper device enrollment protocol:
+1. User authenticates to their account.
+2. New device generates its own cryptographic identity.
+3. Existing trusted device authorizes the new device, or the user supplies the recovery key.
+4. Necessary vault keys are securely transferred or wrapped for the new device.
+5. The new device receives an authorized device identity.
+6. Server issues limited synchronization credentials.
+7. Device can subsequently be revoked.
+Don't just transmit the DEK through a QR code or ordinary pairing token.
+
+Device enrollment should use an authenticated, encrypted protocol with protection against replay, interception and unauthorized enrollment.
+
+3. Cross-platform compatibility still has some questionable decisions
+The new specification is much more realistic, but I would make three additional changes.
+A. Separate official browser support from experimental support
+The revised plan now includes:
+- Chrome
+- Edge
+- Firefox
+- Brave
+- Opera
+- Firefox for Android
+- Kiwi
+- Orion
+- Safari
+- Mobile Chrome
+This is too broad for a first release.
+
+I would organize the targets as follows:
+Platform	Recommended status
+Chrome Desktop	Primary
+Edge Desktop	Primary
+Firefox Desktop	Primary
+Brave Desktop	Secondary
+Opera Desktop	Secondary
+Firefox Android	Mobile target
+Safari macOS	Separate milestone
+Safari iOS	Separate milestone
+Chrome Android	Web companion
+Kiwi / Orion	Experimental
+
+The distinction matters because Chromium-based browsers are not automatically identical in extension behavior.
+
+Safari also requires its own packaging and distribution workflow. Apple documents that Safari Web Extensions are distributed through macOS or iOS applications and packaged using Xcode. 
+
+Apple Developer Documentation
+
+Firefox for iOS should not be treated as a Firefox Android extension target. Its add-on system is different and does not support Firefox's regular extensions. 
+
+Firefox for iOS Help
+
+B. The Safari/mobile web companion has a functional limitation
+This is something the new document hasn't fully considered.
+
+Suppose someone opens the AegisMark web dashboard in Safari on an iPhone.
+
+Can the dashboard automatically read the URL and title of another browser tab?
+
+Generally, no.
+
+A normal web application cannot simply inspect the user's other browser tabs.
+
+You need one of these:
+- Safari Web Extension integration.
+- An iOS share-sheet workflow.
+- Manual URL entry or paste.
+- A native application integration.
+I would strongly recommend implementing the iOS share-sheet workflow as an alternative, even if you eventually support the full Safari extension.
+C. Browser storage and unlimited bookmarks
+The document promises unlimited local bookmarks.
+
+Technically, this needs qualification.
+
+IndexedDB storage is subject to browser storage quotas and eviction behavior. Chrome documents persistent storage options and the unlimitedStorage permission, but those don't eliminate physical device storage limits. 
+
+GitHub+1
+
+Change the promise to:
+
+"Supports large bookmark collections, limited by available device storage, with transparent storage diagnostics and graceful quota handling."
+
+This is more honest and reliable.
+
+4. There are inconsistencies within the revised specification
+These aren't necessarily fatal problems, but they should be fixed before development.
+Document section	Problem	Required correction
+Key hierarchy	256-bit key + 12-word mnemonic	Define standard 24-word recovery or 128-bit recovery
+Encryption	Random IV + counter-based prevention	Specify one complete nonce strategy
+Metadata	Claims all metadata encrypted	Acknowledge visible synchronization fields
+Manifest	Says bookmark permission is dynamically requested	Declare it in optional_permissions for relevant browser builds
+Firefox adapter	Says MV2/MV3 background.js	Define exact browser-specific manifest and background behavior
+Local-first	Claims complete offline functionality	Define web app offline installation and storage lifecycle
+Safari	Combines Safari and web companion	Separate extension from ordinary web app
+Sync	Server assigns revision IDs	Define authenticated revisions and rollback protection
+Conflict handling	Deletion supersedes earlier versions	Define concurrent edit-versus-delete behavior
+Ownership	Claims 100% IP ownership	Add explicit contractual IP assignment and license inventory
+Verification	Uses compile_applet and lint_applet	Replace with actual project build and test commands
+
+The optional permission point is particularly worth fixing: a permission requested at runtime must be declared as an optional permission in the relevant manifest. It cannot simply be requested dynamically without being declared.
+
+5. Important missing features that I would add
+I don't want to turn AegisMark into an unnecessarily complicated application. But there are some features that I consider essential for a trustworthy bookmark manager.
+
+Here are my additions.
+5.1 Bookmark integrity and data protection
+The document needs a stronger data-integrity strategy.
+
+Add:
+- Transactional database operations.
+- Automatic database schema versioning.
+- Safe migration between application versions.
+- Backup validation before restoration.
+- Recovery from interrupted imports.
+- Duplicate record detection.
+- Corrupted-record detection.
+- Graceful handling of insufficient storage.
+- Protection against accidental bulk deletion.
+One feature I particularly recommend is a Trash / Recently Deleted system.
+
+When users delete bookmarks, don't immediately permanently erase them.
+
+Keep them in a recoverable state for a configurable period, and synchronize deletion properly across devices.
+5.2 Secure import and export
+This deserves more attention because importing bookmark files can introduce malicious data.
+
+The application should:
+- Validate imported JSON structures.
+- Validate bookmark URLs.
+- Reject unsupported or dangerous URL schemes.
+- Limit import file sizes.
+- Prevent deeply nested or excessively large structures from exhausting memory.
+- Avoid executing imported HTML or JavaScript.
+- Handle malformed Netscape HTML files safely.
+- Detect duplicates.
+- Provide an import preview before committing changes.
+Also, encrypted JSON and standard Netscape HTML exports are different security products.
+
+The latter is generally plaintext.
+
+The application should warn users before creating an unencrypted export.
+5.3 Better privacy controls
+I'd add a dedicated Privacy Center with:
+Setting	Function
+Local-only mode	Disable cloud synchronization
+Cloud sync toggle	Enable/disable synchronization
+Device list	View authorized devices
+Revoke device	Remove device authorization
+Export vault	Download user data
+Delete cloud data	Request deletion of server-side data
+Delete account	Remove account and associated service data
+Telemetry	Explicitly disclose any optional diagnostics
+Privacy report	Explain exactly what data the server can see
+
+I would make privacy controls understandable to ordinary users rather than displaying cryptographic jargon everywhere.
+5.4 Accessibility and usability
+The revised specification talks about visual design, but accessibility is still underdeveloped.
+
+Add:
+- Full keyboard navigation.
+- Proper screen-reader labels.
+- WCAG 2.2 AA as a design and testing target.
+- Reduced-motion support.
+- High-contrast support.
+- Responsive layouts.
+- Clear error messages.
+- Accessible focus indicators.
+- Consistent terminology.
+- Localization-ready architecture.
+One small but important UX detail: don't display cryptographic technical information to ordinary users unless it helps them make a decision.
+
+For example, show:
+
+"Your vault is encrypted and synchronized."
+
+Provide an advanced security view for people who want to inspect encryption details.
+
+6. The biggest architectural issue: the local vault and web dashboard
+This is something I think the developer should clarify before implementation.
+
+The specification uses:
+- IndexedDB for the local vault.
+- Browser extension storage.
+- A web dashboard.
+- A Safari web companion.
+But these are not automatically the same storage environment.
+
+For example:
+- Chrome extension IndexedDB belongs to the extension's origin.
+- A normal website has a separate IndexedDB database.
+- Safari's extension has its own execution and storage environment.
+- A PWA has its own origin-specific storage.
+Therefore, you cannot simply assume the same vault database is accessible everywhere.
+
+I recommend defining two storage layers:
+Layer 1 — Local vault
+Encrypted local database
+
+Independent per installation and platform.
+- Chrome extension
+- Firefox extension
+- Safari extension
+- Web companion / PWA
+
+Authenticated encrypted synchronization
+
+Layer 2 — Shared cloud vault
+Encrypted synchronization relay
+
+Shared account-level synchronization service.
+- Encrypted records
+- Device authorization
+- Synchronization revisions
+- Encrypted backup history
+
+
+This means each installation has an independent local encrypted vault, but authorized devices synchronize through the same encrypted protocol.
+
+This is much more realistic than pretending all browsers can access one shared local database.
+
+7. Testing is still insufficient
+Needs substantial improvement
+The last section of the revised document is one of my biggest remaining concerns.
+
+It mentions:
+- Theme verification.
+- End-to-end functional verification.
+- Compilation.
+- Linting.
+These are not sufficient for an application that advertises security as its primary differentiator.
+
+I would introduce a dedicated verification plan.
+Testing category	What to test
+Unit testing	Encryption, decryption, key derivation, validation
+Cryptographic testing	Known-answer tests, IV uniqueness and authentication failures
+Property testing	Randomized inputs and data invariants
+Integration testing	IndexedDB, backend and synchronization
+Conflict testing	Concurrent edits, deletions and offline changes
+Recovery testing	Lost passphrase, recovery key and device replacement
+Security testing	XSS, injection, authorization and API vulnerabilities
+Dependency testing	Vulnerable and malicious packages
+Import testing	Malformed, oversized and malicious files
+Compatibility testing	Actual supported browsers and devices
+Performance testing	Large vaults, low-end phones and synchronization
+Accessibility testing	Keyboard, screen readers and contrast
+Migration testing	Upgrades from every supported database version
+
+I would also add these acceptance criteria:
+1. No bookmark disappears silently during synchronization.
+2. A corrupted ciphertext is rejected rather than silently accepted.
+3. An unauthorized device cannot access the vault.
+4. Revoked devices cannot obtain new synchronization data.
+5. Restoring a backup produces a verified vault.
+6. Offline edits synchronize correctly after reconnection.
+7. Failed database migrations do not destroy the previous usable database.
+8. The extension does not transmit plaintext bookmark information to the synchronization backend.
+9. A compromised synchronization server cannot silently replace a device's latest known vault state without detection.
+10. All supported browser builds pass their respective integration tests.
+I would also require an independent security review before the public Pro synchronization service launches.
+
+8. Three additional changes I strongly recommend
+There are three decisions I would make before proceeding.
+
+A. Remove Extension Builder from the actual product
+
+The revised document still includes an Extension Builder & Exporter inside the full workspace (lines 426–436).
+
+I don't think ordinary users need this.
+
+Keep packaging and ZIP generation inside your developer build pipeline. The product should focus on bookmarks, vault management and synchronization.
+
+This will reduce unnecessary complexity and make the product feel more professional.
+
+B. Define Firefox's actual Manifest V3 implementation
+
+The specification says Firefox uses an MV2/MV3 adapter, but it doesn't explain the background implementation.
+
+This matters because Chrome uses extension service workers, while Firefox's Manifest V3 implementation uses background scripts/event pages rather than Chrome-style service workers. 
+
+MDN+1
+
+The developer should implement and test separate browser-specific background configurations.
+
+C. Complete the ownership and commercial requirements
+
+The document still doesn't adequately define:
+- Written IP assignment.
+- Third-party dependency licensing.
+- Source repository ownership.
+- Production infrastructure ownership.
+- Payment provider integration.
+- Subscription expiration and cancellation.
+- Account deletion and data retention.
+- Backup retention and deletion policies.
+Also, your original request mentioned a free trial. The revised specification now has Free and Pro plans, but doesn't explicitly define a time-limited trial.
+
+I'd keep the free plan regardless, and decide separately whether a 7- or 14-day Pro trial is commercially worthwhile.
+
+9. What I would send back to the developer
+I wouldn't ask them to rewrite everything again. The revised plan is good enough to preserve.
+
+Instead, I'd give them one final corrective task.
+
+Here is a message you can copy:
+AegisMark 2.0 is a significant improvement, and I want to retain its overall architecture, product philosophy, and MVP scope. However, before approving it for implementation, I want you to address the following remaining issues.
+
+1. Cryptographic corrections
+- Correct the 256-bit recovery key / 12-word mnemonic inconsistency. Use a properly standardized recovery mechanism, preferably a 24-word BIP39 phrase for 256-bit entropy.
+- Formally specify AES-GCM nonce management. Random IV generation and local counters are not sufficient explanations for a shared DEK across multiple devices.
+- Evaluate per-device derived encryption keys and define their key derivation, rotation, and recovery.
+- Specify authenticated key wrapping, encryption versioning, domain separation, and authenticated additional data (AAD).
+- Make Argon2id the preferred KDF, with properly configured PBKDF2 as an alternative where necessary. Include mobile performance benchmarks.
+2. Metadata privacy
+- Reconcile the zero-knowledge claims with the plaintext synchronization fields.
+- Document precisely what the synchronization server can observe.
+- Minimize exposed timestamps, device identifiers, version information and deletion metadata.
+- Define which metadata is unavoidable for synchronization.
+3. Synchronization security
+- Add anti-replay and anti-rollback protection.
+- Define authenticated synchronization revisions and change history.
+- Specify device enrollment, authorization, revocation and recovery.
+- Define concurrent edit-versus-delete behavior.
+- Protect against a malicious or compromised synchronization server withholding, reordering or replaying valid encrypted records.
+4. Cross-platform compatibility
+- Define exact browser-specific manifests and background execution implementations.
+- Correct the Firefox Manifest V3 background implementation.
+- Declare optional permissions properly.
+- Separate Safari extensions from ordinary web companion functionality.
+- Explain iOS bookmark capture through Safari extension or share-sheet integration.
+- Treat Kiwi and Orion as experimental targets until independently tested.
+- Replace unlimited local storage promises with realistic storage limits and quota handling.
+5. Local storage and data integrity
+- Define database schema migrations, transactional operations and recovery from interrupted migrations.
+- Add backup validation, secure restoration and recoverable deletion.
+- Define secure import/export validation and handling of malicious bookmark files.
+- Clarify how independent browser storage environments synchronize with the shared vault.
+6. Security and quality assurance
+- Add cryptographic known-answer tests, property tests, concurrency tests and integration tests.
+- Add XSS, API authorization, dependency, supply-chain and malicious-import testing.
+- Define security acceptance criteria and independent security review before public cloud-sync launch.
+- Add a documented threat model and limitations of the zero-knowledge architecture.
+7. Product simplification
+- Remove the Extension Builder and ZIP Exporter from the end-user product. Keep these as internal development tools.
+- Keep the main product focused on saving, searching, organizing and synchronizing bookmarks.
+- Add an accessible Privacy Center, storage diagnostics and data recovery controls.
+- Define whether Pro includes a free trial separately from the permanent Free plan.
+8. Ownership and commercial control
+- Add explicit IP assignment and third-party licensing requirements.
+- Ensure source code, repository, domain, backend, infrastructure, payment accounts and store accounts remain under my control.
+- Define subscription cancellation, account deletion, data retention and user export policies.
+Do not unnecessarily expand the product or introduce features that make it complicated. Preserve the local-first philosophy, simple UI/UX and minimal permission strategy.
+
+I want the final result to be a technically consistent, implementable engineering specification, not just a document containing security terminology.
+
+For every proposed security mechanism, explain how it will actually work and how it will be tested. Clearly distinguish implemented capabilities, planned capabilities and future enhancements.
+
+After addressing these points, provide the final AegisMark 2.1 Master Engineering Specification.
+
+
+
+
+
+10. Final verdict
+My recommendation
+Continue development planning
+
+Approve the direction, not yet the implementation.
+AegisMark 2.0 is now a credible architectural foundation. The remaining issues are concentrated in cryptographic correctness, synchronization trust, platform implementation and verification.
+Here is how I would proceed:
+Decision	My recommendation
+Keep AegisMark 2.0 architecture	Yes
+Start UI/UX design	Yes
+Start local-only MVP development	Yes
+Start production cloud synchronization	Not yet
+Publish as a secure product	Not yet
+Request final 2.1 specification	Yes
+
+One important distinction: you don't need to wait for the entire security architecture to be perfected before building the basic bookmark manager. You can develop the local-only MVP while finalizing the synchronization and recovery protocol. Just make sure the local data model and cryptographic interfaces are designed to accommodate those decisions.
+
+My biggest concern is not the UI, pricing or even the choice of programming language. It is whether the developer can correctly implement the encryption and synchronization protocol rather than merely describe it.
+
+If those two components are engineered properly, AegisMark has the foundation to become a genuinely useful, privacy-focused product.
+
+The goal should be a bookmark manager that feels incredibly simple to its users, even though the engineering underneath it is sophisticated.

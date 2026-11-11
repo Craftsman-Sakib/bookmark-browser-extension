@@ -1,0 +1,6 @@
+{
+  "name": "AegisMark - E2EE Cross-Platform Bookmark Extension",
+  "description": "Zero-knowledge end-to-end encrypted bookmarks manager, cross-browser extension, and synchronization hub for Chrome, Edge, Firefox, and mobile.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
